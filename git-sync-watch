@@ -1,0 +1,942 @@
+#!/usr/bin/env node
+'use strict';
+
+/*
+ * git-sync-watch — watch a set of git folders; auto-commit + push local
+ * changes, pull from origin on an interval. Single file, zero dependencies,
+ * Node >= 14, macOS + Linux.
+ *
+ * Commands: add | list | remove | run | install | uninstall | status
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile, execFileSync, spawnSync } = require('child_process');
+const { promisify } = require('util');
+
+const execFileP = promisify(execFile);
+
+const APP = 'git-sync-watch';
+const LABEL = 'com.git-sync-watch';
+const LOCK_FILE = path.join(os.tmpdir(), 'git-sync-watch.lock');
+const DEFAULT_CONFIG = path.join(os.homedir(), '.config', 'git-sync-watch', 'config.ini');
+const PLIST_FILE = path.join(os.homedir(), 'Library', 'LaunchAgents', 'com.git-sync-watch.plist');
+const UNIT_FILE = path.join(os.homedir(), '.config', 'systemd', 'user', 'git-sync-watch.service');
+const CRON_LOG = path.join(os.homedir(), '.local', 'state', 'git-sync-watch.log');
+const LOG_DIR = path.join(os.homedir(), 'Library', 'Logs');
+
+const DEFAULTS = { watchInterval: 3, pullInterval: 300, conflict: 'abort', pullAfterPush: true };
+const POLICIES = ['abort', 'remote', 'force-local'];
+const RELOAD_MS = 5000;
+const THROTTLE_MS = 60000;
+const LOCAL_TIMEOUT = 30000;
+const NET_TIMEOUT = 120000;
+const BOOL_FLAGS = new Set(['once', 'no-start']);
+
+const COMMAND_FLAGS = {
+  add: ['watch-dir', 'branch', 'pull-interval', 'watch-interval', 'conflict', 'pull-after-push', 'config', 'git'],
+  list: ['config'],
+  remove: ['watch-dir', 'config'],
+  run: ['config', 'once', 'git'],
+  install: ['config', 'no-start', 'ssh-auth-sock', 'git'],
+  uninstall: ['config'],
+  status: ['config'],
+};
+
+class UsageError extends Error {}
+
+/* ---------------- logging ---------------- */
+
+function log(folder, level, msg) {
+  const ts = new Date().toISOString();
+  const f = folder ? ' [' + folder + ']' : '';
+  console.error('[' + ts + '] ' + level + f + ' ' + msg);
+}
+
+const lastLog = new Map();
+function throttleLog(folder, level, msg, key) {
+  const now = Date.now();
+  if (now - (lastLog.get(key) || 0) < THROTTLE_MS) return;
+  lastLog.set(key, now);
+  log(folder, level, msg);
+}
+
+function errText(res) {
+  const s = (res.stderr || '').trim();
+  return s ? s.split('\n').slice(-4).join(' | ') : 'exit code ' + res.code;
+}
+
+/* ---------------- arg parsing ---------------- */
+
+function parseArgs(argv) {
+  const out = { flags: {}, positional: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--help' || a === '-h') { out.help = true; continue; }
+    if (!a.startsWith('--')) { out.positional.push(a); continue; }
+    const eq = a.indexOf('=');
+    if (eq !== -1) { out.flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
+    const name = a.slice(2);
+    if (BOOL_FLAGS.has(name)) { out.flags[name] = 'true'; continue; }
+    if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) throw new UsageError('missing value for --' + name);
+    out.flags[name] = argv[++i];
+  }
+  return out;
+}
+
+function requireInt(v, name) {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) throw new UsageError(name + ' must be an integer >= 1');
+  return n;
+}
+
+function requireBool(v, name) {
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  throw new UsageError(name + ' must be true or false');
+}
+
+function requireEnum(v, name) {
+  if (POLICIES.indexOf(v) !== -1) return v;
+  throw new UsageError(name + ' must be one of: ' + POLICIES.join(', '));
+}
+
+const USAGE = APP + ' — watch git folders; auto-commit + push changes, periodic pull\n' +
+  '\n' +
+  'usage: ' + APP + ' <command> [flags]\n' +
+  '\n' +
+  'commands:\n' +
+  '  add        register a folder to watch (must be a git repo)\n' +
+  '  list       show watched folders (effective settings)\n' +
+  '  remove     stop watching a folder (config only; files untouched)\n' +
+  '  run        run the sync daemon; --once = single sync pass per folder\n' +
+  '  install    set up auto-start (launchd / systemd / cron @reboot)\n' +
+  '  uninstall  remove auto-start; config file is left in place\n' +
+  '  status     show auto-start mechanism + running state + folders\n' +
+  '\n' +
+  'flags:\n' +
+  '  --config PATH          config file (default ' + DEFAULT_CONFIG + '; env GIT_SYNC_WATCH_CONFIG)\n' +
+  '  --git PATH             git binary (default: git from PATH)\n' +
+  '  --help                 show this help\n' +
+  '\n' +
+  'add:\n' +
+  '  --watch-dir DIR        (required) folder to watch\n' +
+  '  --branch B             branch to sync (default: current branch)\n' +
+  '  --pull-interval N      seconds between pulls (default 300)\n' +
+  '  --watch-interval N     seconds between change checks (default 3)\n' +
+  '  --conflict POLICY      abort | remote | force-local (default abort)\n' +
+  '  --pull-after-push B    true | false (default true)\n' +
+  '\n' +
+  'run:\n' +
+  '  --once                 one full sync cycle per folder, then exit\n' +
+  '\n' +
+  'install:\n' +
+  '  --no-start             write the auto-start file only; don\'t enable\n' +
+  '  --ssh-auth-sock PATH   SSH agent socket for launchd/systemd/cron\n';
+
+function usage(stream) {
+  stream.write(USAGE);
+}
+
+/* ---------------- config (INI) model ---------------- */
+
+function parseIni(text) {
+  const model = { defaults: {}, watches: [] };
+  let section = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line || line[0] === ';' || line[0] === '#') continue;
+    const m = /^\[([^\]]+)\]$/.exec(line);
+    if (m) { section = m[1]; continue; }
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    const value = line.slice(eq + 1).trim();
+    if (!section) continue;
+    if (section === 'defaults') {
+      model.defaults[key] = value;
+    } else if (/^watch-\d+$/.test(section)) {
+      let w = null;
+      for (const x of model.watches) if (x._section === section) w = x;
+      if (!w) { w = { _section: section, keys: {} }; model.watches.push(w); }
+      w.keys[key] = value;
+    }
+  }
+  return model;
+}
+
+function parseNum(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    log('', 'warn', 'invalid ' + name + ' "' + raw + '" in config — using default ' + fallback);
+    return fallback;
+  }
+  return n;
+}
+
+function parseBool(raw, fallback, name) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  log('', 'warn', 'invalid ' + name + ' "' + raw + '" in config — using default ' + fallback);
+  return fallback;
+}
+
+function parseEnum(raw, fallback, allowed, name) {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  if (allowed.indexOf(raw) !== -1) return raw;
+  log('', 'warn', 'invalid ' + name + ' "' + raw + '" in config — using default ' + fallback);
+  return fallback;
+}
+
+function resolveConfigModel(raw) {
+  const d = raw.defaults;
+  const defaults = {
+    watchInterval: parseNum(d['watch-interval'], DEFAULTS.watchInterval, 'watch-interval'),
+    pullInterval: parseNum(d['pull-interval'], DEFAULTS.pullInterval, 'pull-interval'),
+    conflict: parseEnum(d['conflict'], DEFAULTS.conflict, POLICIES, 'conflict'),
+    pullAfterPush: parseBool(d['pull-after-push'], DEFAULTS.pullAfterPush, 'pull-after-push'),
+  };
+  const watches = [];
+  for (const w of raw.watches) {
+    const k = w.keys;
+    if (!k['path']) { log('', 'warn', 'watch section without path ignored'); continue; }
+    const watch = { path: k['path'], explicit: {} };
+    if (k['branch']) { watch.branch = k['branch']; watch.explicit.branch = true; }
+    if (k['pull-interval']) { watch.pullInterval = parseNum(k['pull-interval'], defaults.pullInterval, 'pull-interval'); watch.explicit.pullInterval = true; }
+    if (k['watch-interval']) { watch.watchInterval = parseNum(k['watch-interval'], defaults.watchInterval, 'watch-interval'); watch.explicit.watchInterval = true; }
+    if (k['conflict']) { watch.conflict = parseEnum(k['conflict'], defaults.conflict, POLICIES, 'conflict'); watch.explicit.conflict = true; }
+    if (k['pull-after-push']) { watch.pullAfterPush = parseBool(k['pull-after-push'], defaults.pullAfterPush, 'pull-after-push'); watch.explicit.pullAfterPush = true; }
+    watches.push(watch);
+  }
+  return { defaults, watches };
+}
+
+function serializeIni(model) {
+  const lines = [
+    '; ' + APP + ' config',
+    '[defaults]',
+    'watch-interval = ' + model.defaults.watchInterval,
+    'pull-interval = ' + model.defaults.pullInterval,
+    'conflict = ' + model.defaults.conflict,
+    'pull-after-push = ' + model.defaults.pullAfterPush,
+  ];
+  model.watches.forEach((w, i) => {
+    lines.push('', '[watch-' + (i + 1) + ']', 'path = ' + w.path);
+    if (w.explicit.branch) lines.push('branch = ' + w.branch);
+    if (w.explicit.pullInterval) lines.push('pull-interval = ' + w.pullInterval);
+    if (w.explicit.watchInterval) lines.push('watch-interval = ' + w.watchInterval);
+    if (w.explicit.conflict) lines.push('conflict = ' + w.conflict);
+    if (w.explicit.pullAfterPush) lines.push('pull-after-push = ' + w.pullAfterPush);
+  });
+  return lines.join('\n') + '\n';
+}
+
+function loadConfig(configPath) {
+  let text = '';
+  try {
+    text = fs.readFileSync(configPath, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+  }
+  const raw = text ? parseIni(text) : { defaults: {}, watches: [] };
+  return resolveConfigModel(raw);
+}
+
+function writeConfig(configPath, model) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, serializeIni(model));
+}
+
+function effectiveFolder(w, defaults) {
+  return {
+    path: w.path,
+    branch: w.branch || 'main',
+    watchInterval: w.watchInterval || defaults.watchInterval,
+    pullInterval: w.pullInterval || defaults.pullInterval,
+    conflict: w.conflict || defaults.conflict,
+    pullAfterPush: w.pullAfterPush !== undefined ? w.pullAfterPush : defaults.pullAfterPush,
+  };
+}
+
+function resolveConfigPath(flags) {
+  return flags['config'] || process.env.GIT_SYNC_WATCH_CONFIG || DEFAULT_CONFIG;
+}
+
+/* ---------------- git runner ---------------- */
+
+let gitBinCache = null;
+function resolveGit(gitFlag) {
+  if (gitFlag) return gitFlag;
+  if (gitBinCache) return gitBinCache;
+  const envGit = process.env.GIT_SYNC_WATCH_GIT;
+  if (envGit) { gitBinCache = envGit; return gitBinCache; }
+  const candidates = ['git', '/opt/homebrew/bin/git', '/usr/local/bin/git', '/usr/bin/git'];
+  for (const c of candidates) {
+    try { execFileSync(c, ['--version'], { stdio: 'ignore' }); gitBinCache = c; return gitBinCache; } catch (_) {}
+  }
+  gitBinCache = 'git';
+  return gitBinCache;
+}
+
+async function runGit(args, opts) {
+  opts = opts || {};
+  const bin = resolveGit(opts.git);
+  try {
+    const r = await execFileP(bin, args, {
+      cwd: opts.cwd,
+      env: Object.assign({}, process.env, { GIT_TERMINAL_PROMPT: '0' }),
+      timeout: opts.timeout || LOCAL_TIMEOUT,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return { ok: true, code: 0, stdout: r.stdout || '', stderr: r.stderr || '' };
+  } catch (e) {
+    return { ok: false, code: e.code || -1, stdout: e.stdout || '', stderr: e.stderr || '', timedOut: !!e.killed, error: e };
+  }
+}
+
+/* ---------------- add / list / remove ---------------- */
+
+async function cmdAdd(flags) {
+  const configPath = resolveConfigPath(flags);
+  const watchDir = flags['watch-dir'];
+  if (!watchDir) throw new UsageError('add requires --watch-dir DIR');
+
+  let real;
+  try {
+    real = fs.realpathSync(watchDir);
+  } catch (e) {
+    if (e.code === 'ENOENT') { console.error('error: directory does not exist: ' + watchDir); process.exitCode = 1; return; }
+    throw e;
+  }
+
+  const ver = await runGit(['--version'], { git: flags['git'] });
+  if (!ver.ok) { console.error('error: git not available'); process.exitCode = 1; return; }
+
+  const wt = await runGit(['rev-parse', '--is-inside-work-tree'], { git: flags['git'], cwd: real });
+  if (!wt.ok || wt.stdout.trim() !== 'true') {
+    console.error('error: not a git repository — run `git init` or clone first');
+    process.exitCode = 1;
+    return;
+  }
+
+  let branch = flags['branch'];
+  if (!branch) {
+    // symbolic-ref works on unborn branches (rev-parse --abbrev-ref fails there)
+    const sr = await runGit(['symbolic-ref', '--short', 'HEAD'], { git: flags['git'], cwd: real });
+    if (sr.ok && sr.stdout.trim()) {
+      branch = sr.stdout.trim();
+    } else {
+      const br = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { git: flags['git'], cwd: real });
+      branch = br.ok && br.stdout.trim() && br.stdout.trim() !== 'HEAD' ? br.stdout.trim() : 'main';
+    }
+  }
+
+  const rem = await runGit(['remote'], { git: flags['git'], cwd: real });
+  if (rem.ok && rem.stdout.split('\n').map(s => s.trim()).indexOf('origin') === -1) {
+    console.error('warning: no origin remote configured; push/pull will be disabled for this folder');
+  }
+
+  const model = loadConfig(configPath);
+  for (const w of model.watches) {
+    if (w.path === real) { console.error('error: already watched: ' + real); process.exitCode = 1; return; }
+  }
+
+  const w = { path: real, explicit: { branch: true }, branch };
+  if (flags['pull-interval'] !== undefined) { w.pullInterval = requireInt(flags['pull-interval'], '--pull-interval'); w.explicit.pullInterval = true; }
+  if (flags['watch-interval'] !== undefined) { w.watchInterval = requireInt(flags['watch-interval'], '--watch-interval'); w.explicit.watchInterval = true; }
+  if (flags['conflict'] !== undefined) { w.conflict = requireEnum(flags['conflict'], '--conflict'); w.explicit.conflict = true; }
+  if (flags['pull-after-push'] !== undefined) { w.pullAfterPush = requireBool(flags['pull-after-push'], '--pull-after-push'); w.explicit.pullAfterPush = true; }
+
+  model.watches.push(w);
+  writeConfig(configPath, model);
+  console.log('watching ' + real);
+  console.log('config: ' + configPath);
+}
+
+function cmdList(flags) {
+  const model = loadConfig(resolveConfigPath(flags));
+  if (model.watches.length === 0) { console.log('no folders configured'); return; }
+  for (const w of model.watches) {
+    const f = effectiveFolder(w, model.defaults);
+    console.log(f.path + ' (branch ' + f.branch + ', pull every ' + f.pullInterval + 's, watch every ' + f.watchInterval +
+      's, conflict ' + f.conflict + ', pull-after-push ' + f.pullAfterPush + ')');
+  }
+}
+
+function cmdRemove(flags) {
+  const dir = flags['watch-dir'];
+  if (!dir) throw new UsageError('remove requires --watch-dir DIR');
+  let real;
+  try { real = fs.realpathSync(dir); } catch (_) { real = path.resolve(dir); }
+  const configPath = resolveConfigPath(flags);
+  const model = loadConfig(configPath);
+  let idx = -1;
+  for (let i = 0; i < model.watches.length; i++) {
+    if (model.watches[i].path === real) { idx = i; break; }
+  }
+  if (idx === -1) { console.log('not watched'); return; }
+  const removed = model.watches[idx];
+  model.watches.splice(idx, 1);
+  writeConfig(configPath, model);
+  console.log('removed ' + removed.path);
+}
+
+/* ---------------- daemon ---------------- */
+
+const loopState = new Map(); // path -> state
+
+function makeLoopState(folder) {
+  return { folder, pending: 0, lastPullAt: 0, busy: false, pulledThisCycle: false, origin: null, interval: null };
+}
+
+function acquireLock() {
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeSync(fd, String(process.pid) + '\n');
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    let pid = NaN;
+    try { pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf8'), 10); } catch (_) {}
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        return false; // live process
+      } catch (err) {
+        if (err.code !== 'ESRCH') return false; // exists but not ours (EPERM)
+      }
+      // stale
+    }
+    try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+    return acquireLock();
+  }
+}
+
+function registerLockCleanup() {
+  const release = () => { try { fs.unlinkSync(LOCK_FILE); } catch (_) {} };
+  process.on('exit', release);
+  process.on('SIGINT', () => { release(); process.exit(0); });
+  process.on('SIGTERM', () => { release(); process.exit(0); });
+}
+
+function commitLocal(folder, changed) {
+  return runGit(['add', '-A'], { cwd: folder.path }).then(async (add) => {
+    if (!add.ok) { log(folder.path, 'error', 'git add failed: ' + errText(add)); return false; }
+    const diff = await runGit(['diff', '--cached', '--quiet'], { cwd: folder.path });
+    if (diff.ok) return false; // nothing staged
+    if (diff.code !== 1) { log(folder.path, 'error', 'git diff failed: ' + errText(diff)); return false; }
+    const msg = APP + ': sync ' + changed + ' file(s)';
+    const commit = await runGit(['commit', '-m', msg], { cwd: folder.path });
+    if (commit.ok) { log(folder.path, 'info', 'committed ' + msg); return true; }
+    log(folder.path, 'error', 'git commit failed: ' + errText(commit));
+    return false;
+  });
+}
+
+async function handlePullFailure(folder, res) {
+  log(folder.path, 'error', 'git pull failed: ' + errText(res));
+  const mh = await runGit(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: folder.path });
+  let aborted = false;
+  if (mh.ok) {
+    const ab = await runGit(['merge', '--abort'], { cwd: folder.path });
+    aborted = ab.ok;
+    log(folder.path, 'warn', 'merge --abort executed (pre-pull tree restored)');
+  }
+  if (folder.conflict === 'remote') {
+    if (aborted) {
+      const rs = await runGit(['reset', '--hard', 'origin/' + folder.branch], { cwd: folder.path });
+      if (rs.ok) log(folder.path, 'warn', 'policy remote: reset --hard origin/' + folder.branch + ' (local changes discarded)');
+      else log(folder.path, 'error', 'policy remote: reset --hard failed: ' + errText(rs));
+    } else {
+      throttleLog(folder.path, 'error', 'pull failed (no merge conflict) — will retry: ' + errText(res), 'pullfail:' + folder.path);
+    }
+  } else if (folder.conflict === 'force-local') {
+    const fp = await runGit(['push', '--force', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+    if (fp.ok) log(folder.path, 'warn', 'policy force-local: pushed --force (remote overwritten)');
+    else log(folder.path, 'error', 'policy force-local: force push failed: ' + errText(fp));
+  } else {
+    throttleLog(folder.path, 'error',
+      'conflict — resolve manually or `git reset --hard origin/' + folder.branch + '` to discard local — will retry each pull cycle',
+      'conflict:' + folder.path);
+  }
+}
+
+async function handlePushFailure(folder, res) {
+  if (folder.conflict === 'remote') {
+    const pull = await runGit(['pull', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+    if (pull.ok) {
+      const retry = await runGit(['push', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+      if (retry.ok) { log(folder.path, 'info', 'push retry succeeded after pull'); return; }
+    } else {
+      const mh = await runGit(['rev-parse', '-q', '--verify', 'MERGE_HEAD'], { cwd: folder.path });
+      if (mh.ok) await runGit(['merge', '--abort'], { cwd: folder.path });
+    }
+    await runGit(['reset', '--hard', 'origin/' + folder.branch], { cwd: folder.path });
+    const fp = await runGit(['push', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+    if (fp.ok) log(folder.path, 'warn', 'policy remote: reset --hard origin/' + folder.branch + ' + push (local discarded)');
+    else log(folder.path, 'error', 'policy remote: reset + push failed: ' + errText(fp));
+  } else if (folder.conflict === 'force-local') {
+    const fp = await runGit(['push', '--force', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+    if (fp.ok) log(folder.path, 'warn', 'policy force-local: pushed --force (remote overwritten)');
+    else log(folder.path, 'error', 'policy force-local: force push failed: ' + errText(fp));
+  } else {
+    throttleLog(folder.path, 'error', 'git push failed: ' + errText(res) + ' — will retry next commit/pull cycle', 'pushfail:' + folder.path);
+  }
+}
+
+async function push(folder) {
+  const ahead = await runGit(['rev-list', '--count', 'origin/' + folder.branch + '..HEAD'], { cwd: folder.path });
+  if (ahead.ok && Number(ahead.stdout.trim()) === 0) return true; // nothing to push
+  const res = await runGit(['push', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+  if (res.ok) { log(folder.path, 'info', 'pushed to origin/' + folder.branch); return true; }
+  await handlePushFailure(folder, res);
+  return false;
+}
+
+async function doCycle(st, opts) {
+  opts = opts || {};
+  if (st.busy) return { ok: false, skipped: true };
+  st.busy = true;
+  st.pulledThisCycle = false;
+  const folder = st.folder;
+  let ok = true;
+  try {
+    // 1. repo check
+    const wt = await runGit(['rev-parse', '--is-inside-work-tree'], { cwd: folder.path });
+    if (!wt.ok || wt.stdout.trim() !== 'true') {
+      throttleLog(folder.path, 'error', 'folder is not a git repo — skipped', 'repo:' + folder.path);
+      return { ok: false };
+    }
+    // origin detection (cached per loop)
+    if (st.origin === null) {
+      const rem = await runGit(['remote'], { cwd: folder.path });
+      st.origin = rem.ok && rem.stdout.split('\n').map(s => s.trim()).indexOf('origin') !== -1;
+      if (!st.origin) log(folder.path, 'warn', 'no origin remote — push/pull disabled for this folder');
+    }
+    const hasOrigin = st.origin;
+
+    // 2. change detection (git's own ignore semantics apply)
+    const status = await runGit(['status', '--porcelain', '-z'], { cwd: folder.path });
+    let changed = 0;
+    if (status.ok) {
+      changed = status.stdout.replace(/\0+$/, '').split('\0').filter(Boolean).length;
+    } else {
+      throttleLog(folder.path, 'error', 'git status failed: ' + errText(status), 'status:' + folder.path);
+      return { ok: false };
+    }
+    st.pending = changed > 0 ? st.pending + 1 : 0;
+
+    // commit: daemon debounces (2 consecutive dirty ticks); --once commits immediately
+    let committed = false;
+    if (opts.once ? changed > 0 : st.pending >= 2) {
+      committed = await commitLocal(folder, changed);
+      if (committed) st.pending = 0;
+    }
+
+    // 3. periodic pull (+ push after successful pull)
+    let pushed = false;
+    const now = Date.now();
+    if (hasOrigin && now - st.lastPullAt >= folder.pullInterval * 1000) {
+      st.lastPullAt = now;
+      if (st.pending > 0) { if (await commitLocal(folder, changed)) st.pending = 0; }
+      const pull = await runGit(['pull', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+      if (pull.ok) {
+        if (await push(folder)) pushed = true;
+        else if (opts.once) ok = false;
+      } else {
+        await handlePullFailure(folder, pull);
+      }
+      st.pulledThisCycle = true;
+    }
+
+    // 4. push after step-2 commit
+    if (hasOrigin && committed) {
+      if (await push(folder)) pushed = true;
+      else if (opts.once) ok = false;
+    }
+
+    // 5. pull-after-push (one immediate pull; re-push only if HEAD changed)
+    if (hasOrigin && folder.pullAfterPush && pushed && !st.pulledThisCycle) {
+      const before = await runGit(['rev-parse', 'HEAD'], { cwd: folder.path });
+      const beforeHead = before.ok ? before.stdout.trim() : '';
+      const pull = await runGit(['pull', 'origin', folder.branch], { cwd: folder.path, timeout: NET_TIMEOUT });
+      if (pull.ok) {
+        const after = await runGit(['rev-parse', 'HEAD'], { cwd: folder.path });
+        if (after.ok && after.stdout.trim() !== beforeHead) {
+          await push(folder);
+        }
+      } else {
+        await handlePullFailure(folder, pull);
+      }
+    }
+
+    return { ok };
+  } catch (e) {
+    throttleLog(folder.path, 'error', 'cycle error: ' + (e && e.message ? e.message : e), 'cycle:' + folder.path);
+    return { ok: false };
+  } finally {
+    st.busy = false;
+  }
+}
+
+function sameFolder(a, b) {
+  return a.branch === b.branch && a.watchInterval === b.watchInterval &&
+    a.pullInterval === b.pullInterval && a.conflict === b.conflict && a.pullAfterPush === b.pullAfterPush;
+}
+
+function startFolderLoop(folder) {
+  const st = makeLoopState(folder);
+  st.interval = setInterval(() => { doCycle(st); }, folder.watchInterval * 1000);
+  loopState.set(folder.path, st);
+  log(folder.path, 'info', 'watching (branch ' + folder.branch + ', pull every ' + folder.pullInterval +
+    's, watch every ' + folder.watchInterval + 's, conflict ' + folder.conflict + ', pull-after-push ' + folder.pullAfterPush + ')');
+  doCycle(st);
+}
+
+function reconcile(newFolders) {
+  const byPath = new Map();
+  for (const f of newFolders) byPath.set(f.path, f);
+  for (const entry of Array.from(loopState.entries())) {
+    const p = entry[0];
+    const st = entry[1];
+    const nf = byPath.get(p);
+    if (!nf) {
+      clearInterval(st.interval);
+      loopState.delete(p);
+      log(p, 'info', 'no longer watched (config removed)');
+    } else if (!sameFolder(st.folder, nf)) {
+      clearInterval(st.interval);
+      loopState.delete(p);
+      log(p, 'info', 'config changed — restarting loop');
+      startFolderLoop(nf);
+    }
+  }
+  for (const f of newFolders) {
+    if (!loopState.has(f.path)) startFolderLoop(f);
+  }
+}
+
+function configMtime(p) {
+  try { return fs.statSync(p).mtimeMs; } catch (_) { return 0; }
+}
+
+async function runOnce(model) {
+  const folders = model.watches.map(w => effectiveFolder(w, model.defaults));
+  if (folders.length === 0) { console.log('no folders configured'); return 0; }
+  let failed = 0;
+  for (const f of folders) {
+    const st = makeLoopState(f);
+    const res = await doCycle(st, { once: true });
+    if (!res.ok) failed++;
+  }
+  return failed === 0 ? 0 : 1;
+}
+
+async function cmdRun(flags) {
+  const configPath = resolveConfigPath(flags);
+  const model = loadConfig(configPath);
+  if (flags['once']) {
+    process.exitCode = await runOnce(model);
+    return;
+  }
+  if (!acquireLock()) {
+    let pid = 'unknown';
+    try { pid = fs.readFileSync(LOCK_FILE, 'utf8').trim(); } catch (_) {}
+    console.log('already running (pid ' + pid + ')');
+    return;
+  }
+  registerLockCleanup();
+  const folders = model.watches.map(w => effectiveFolder(w, model.defaults));
+  log('', 'info', 'started (config ' + configPath + ')');
+  if (folders.length === 0) log('', 'info', 'no folders configured — use `' + APP + ' add`');
+  for (const f of folders) startFolderLoop(f);
+  let lastMtime = configMtime(configPath);
+  setInterval(() => {
+    const mtime = configMtime(configPath);
+    if (mtime !== lastMtime) {
+      lastMtime = mtime;
+      try {
+        const m2 = loadConfig(configPath);
+        reconcile(m2.watches.map(w => effectiveFolder(w, m2.defaults)));
+      } catch (e) {
+        log('', 'error', 'config reload failed: ' + (e && e.message ? e.message : e));
+      }
+    }
+  }, RELOAD_MS);
+}
+
+/* ---------------- auto-start install / uninstall / status ---------------- */
+
+function escXml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function buildPlistXml(c) {
+  const lines = [];
+  lines.push('<?xml version="1.0" encoding="UTF-8"?>');
+  lines.push('<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">');
+  lines.push('<plist version="1.0"><dict>');
+  lines.push('  <key>Label</key><string>' + escXml(LABEL) + '</string>');
+  lines.push('  <key>ProgramArguments</key><array>');
+  for (const s of [c.nodePath, c.scriptPath, 'run', '--config', c.configPath, '--git', c.gitPath]) {
+    lines.push('    <string>' + escXml(s) + '</string>');
+  }
+  lines.push('  </array>');
+  lines.push('  <key>RunAtLoad</key><true/>');
+  lines.push('  <key>KeepAlive</key><true/>');
+  lines.push('  <key>ProcessType</key><string>Background</string>');
+  lines.push('  <key>StandardOutPath</key><string>' + escXml(path.join(LOG_DIR, 'git-sync-watch.out.log')) + '</string>');
+  lines.push('  <key>StandardErrorPath</key><string>' + escXml(path.join(LOG_DIR, 'git-sync-watch.err.log')) + '</string>');
+  if (c.sshSock) lines.push('  <key>EnvironmentVariables</key><dict><key>SSH_AUTH_SOCK</key><string>' + escXml(c.sshSock) + '</string></dict>');
+  lines.push('</dict></plist>');
+  return lines.join('\n') + '\n';
+}
+
+function buildUnitText(c) {
+  const lines = [
+    '[Unit]',
+    'Description=Git sync watcher (' + APP + ')',
+    'After=network-online.target',
+    '',
+    '[Service]',
+    'Type=simple',
+    'ExecStart=' + c.nodePath + ' ' + c.scriptPath + ' run --config ' + c.configPath + ' --git ' + c.gitPath,
+    'Restart=on-failure',
+    'RestartSec=5',
+  ];
+  if (c.sshSock) lines.push('Environment=SSH_AUTH_SOCK=' + c.sshSock);
+  lines.push('', '[Install]', 'WantedBy=default.target');
+  return lines.join('\n') + '\n';
+}
+
+function buildCronLine(c) {
+  return '@reboot ' + c.nodePath + ' ' + c.scriptPath + ' run --config ' + c.configPath + ' --git ' + c.gitPath +
+    ' >> ' + CRON_LOG + ' 2>&1';
+}
+
+function hasBin(name) {
+  const r = spawnSync('sh', ['-c', 'command -v ' + name], { stdio: 'pipe' });
+  return r.status === 0 && r.stdout.toString().trim() !== '';
+}
+
+function resolveInstallGit(flags) {
+  if (flags['git']) return path.resolve(flags['git']);
+  const r = spawnSync('which', ['git'], { encoding: 'utf8' });
+  return r.status === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+}
+
+function enableLaunchd(plistFile) {
+  const uid = process.getuid();
+  const r = spawnSync('launchctl', ['bootstrap', 'gui/' + uid, plistFile], { stdio: 'pipe' });
+  if (r.status !== 0) {
+    const print = spawnSync('launchctl', ['print', 'gui/' + uid + '/' + LABEL], { stdio: 'pipe' });
+    if (print.status === 0) return; // already running — fine
+    const r2 = spawnSync('launchctl', ['load', '-w', plistFile], { stdio: 'pipe' });
+    if (r2.status !== 0) {
+      console.error('warning: launchctl failed to start the service: ' + ((r.stderr || r2.stderr || '').toString().trim()));
+      console.error('start it manually with: launchctl bootstrap gui/' + uid + ' ' + plistFile);
+    }
+  }
+}
+
+function crontabList() {
+  const r = spawnSync('crontab', ['-l'], { encoding: 'utf8' });
+  if (r.status !== 0) return [];
+  return r.stdout.split('\n').filter(l => l.trim() !== '');
+}
+
+function crontabWrite(lines) {
+  const r = spawnSync('crontab', ['-'], { input: lines.join('\n') + '\n', encoding: 'utf8' });
+  if (r.status !== 0) throw new Error('crontab write failed: ' + (r.stderr || '').trim());
+}
+
+function installCron(c) {
+  const current = crontabList().filter(l => l.indexOf(APP) === -1);
+  current.push('# ' + APP, buildCronLine(c));
+  crontabWrite(current);
+}
+
+function cmdInstall(flags) {
+  const configPath = path.resolve(resolveConfigPath(flags));
+  const nodePath = process.execPath;
+  const scriptPath = fs.realpathSync(__filename);
+  const gitPath = resolveInstallGit(flags);
+  if (!gitPath) { console.error('error: git not available'); process.exitCode = 1; return; }
+  const gv = spawnSync(gitPath, ['--version'], { stdio: 'ignore' });
+  if (gv.status !== 0) { console.error('error: git not available (' + gitPath + ')'); process.exitCode = 1; return; }
+  const sshSock = flags['ssh-auth-sock'] || process.env.SSH_AUTH_SOCK || null;
+  const noStart = flags['no-start'] === 'true';
+  const cfg = { nodePath, scriptPath, configPath, gitPath, sshSock };
+
+  if (process.platform === 'darwin') {
+    fs.mkdirSync(path.dirname(PLIST_FILE), { recursive: true });
+    fs.writeFileSync(PLIST_FILE, buildPlistXml(cfg));
+    if (!noStart) enableLaunchd(PLIST_FILE);
+    console.log('installed (launchd): ' + PLIST_FILE);
+    if (noStart) {
+      console.log('not started (--no-start) — enable with: launchctl bootstrap gui/' + process.getuid() + ' ' + PLIST_FILE);
+    }
+  } else if (process.platform === 'linux') {
+    if (hasBin('systemctl')) {
+      fs.mkdirSync(path.dirname(UNIT_FILE), { recursive: true });
+      fs.writeFileSync(UNIT_FILE, buildUnitText(cfg));
+      const en = spawnSync('systemctl', ['--user', 'enable', '--now', 'git-sync-watch.service'], { encoding: 'utf8' });
+      if (en.status !== 0) {
+        console.error('warning: systemctl --user enable failed: ' + ((en.stderr || en.stdout || '').trim()));
+        console.error('unit installed at ' + UNIT_FILE + ' — enable manually with:');
+        console.error('  systemctl --user enable --now ' + UNIT_FILE);
+      } else {
+        spawnSync('loginctl', ['enable-linger', process.env.USER || os.userInfo().username], { stdio: 'ignore' });
+        console.log('installed (systemd): ' + UNIT_FILE);
+      }
+    } else {
+      installCron(cfg);
+      console.log('installed (cron @reboot)');
+    }
+  } else {
+    console.error('error: unsupported platform ' + process.platform);
+    process.exitCode = 1;
+  }
+}
+
+function cmdUninstall() {
+  const removed = [];
+  if (process.platform === 'darwin') {
+    const uid = process.getuid();
+    const target = 'gui/' + uid + '/' + LABEL;
+    const b = spawnSync('launchctl', ['bootout', target], { stdio: 'pipe' });
+    if (b.status !== 0) {
+      const print = spawnSync('launchctl', ['print', target], { stdio: 'pipe' });
+      if (print.status === 0) {
+        spawnSync('launchctl', ['bootout', target], { stdio: 'pipe' });
+        removed.push('launchd service');
+      }
+      if (fs.existsSync(PLIST_FILE)) {
+        spawnSync('launchctl', ['unload', '-w', PLIST_FILE], { stdio: 'pipe' });
+      }
+    } else {
+      removed.push('launchd service');
+    }
+    if (fs.existsSync(PLIST_FILE)) {
+      fs.unlinkSync(PLIST_FILE);
+      removed.push('launchd plist ' + PLIST_FILE);
+    }
+  }
+  if (process.platform === 'linux' && hasBin('systemctl')) {
+    const d = spawnSync('systemctl', ['--user', 'disable', '--now', 'git-sync-watch.service'], { stdio: 'pipe' });
+    if (d.status === 0) removed.push('systemd unit');
+    if (fs.existsSync(UNIT_FILE)) {
+      fs.unlinkSync(UNIT_FILE);
+      spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
+      removed.push('systemd unit file ' + UNIT_FILE);
+    }
+  }
+  const current = crontabList();
+  if (current.some(l => l.indexOf(APP) !== -1)) {
+    crontabWrite(current.filter(l => l.indexOf(APP) === -1));
+    removed.push('crontab @reboot entry');
+  }
+  if (removed.length === 0) console.log('not installed');
+  else console.log('removed: ' + removed.join(', '));
+}
+
+function cmdStatus(flags) {
+  const model = loadConfig(resolveConfigPath(flags));
+  let mechanism = 'none';
+  let running = false;
+  if (process.platform === 'darwin' && fs.existsSync(PLIST_FILE)) {
+    mechanism = 'launchd';
+    running = spawnSync('launchctl', ['print', 'gui/' + process.getuid() + '/' + LABEL], { stdio: 'ignore' }).status === 0;
+  } else if (fs.existsSync(UNIT_FILE)) {
+    mechanism = 'systemd';
+    const r = spawnSync('systemctl', ['--user', 'is-active', 'git-sync-watch.service'], { encoding: 'utf8' });
+    running = r.status === 0 && r.stdout.trim() === 'active';
+  } else if (crontabList().some(l => l.indexOf(APP) !== -1)) {
+    mechanism = 'cron';
+    running = spawnSync('pgrep', ['-f', APP + '.*run'], { stdio: 'ignore' }).status === 0;
+  }
+  console.log('installed: ' + mechanism);
+  console.log('running: ' + (running ? 'yes' : 'no'));
+  const folders = model.watches.map(w => effectiveFolder(w, model.defaults));
+  console.log('folders (' + folders.length + '):');
+  for (const f of folders) {
+    console.log('  ' + f.path + ' (branch ' + f.branch + ', pull every ' + f.pullInterval + 's, watch every ' + f.watchInterval + 's)');
+  }
+}
+
+/* ---------------- main ---------------- */
+
+async function main() {
+  let args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (e) {
+    if (e instanceof UsageError) {
+      console.error('error: ' + e.message);
+      usage(process.stderr);
+      process.exitCode = 2;
+      return;
+    }
+    throw e;
+  }
+  const command = args.positional[0];
+  if (args.help) { usage(process.stdout); return; }
+  if (!command) { usage(process.stderr); process.exitCode = 2; return; }
+  if (!COMMAND_FLAGS[command]) {
+    console.error('error: unknown command ' + command);
+    usage(process.stderr);
+    process.exitCode = 2;
+    return;
+  }
+  const allowed = new Set(COMMAND_FLAGS[command]);
+  for (const k of Object.keys(args.flags)) {
+    if (!allowed.has(k)) {
+      console.error('error: unknown flag --' + k + ' for ' + command);
+      usage(process.stderr);
+      process.exitCode = 2;
+      return;
+    }
+  }
+  try {
+    switch (command) {
+      case 'add': await cmdAdd(args.flags); break;
+      case 'list': cmdList(args.flags); break;
+      case 'remove': cmdRemove(args.flags); break;
+      case 'run': await cmdRun(args.flags); break;
+      case 'install': cmdInstall(args.flags); break;
+      case 'uninstall': cmdUninstall(); break;
+      case 'status': cmdStatus(args.flags); break;
+    }
+  } catch (e) {
+    if (e instanceof UsageError) {
+      console.error('error: ' + e.message);
+      process.exitCode = 2;
+      return;
+    }
+    console.error('error: ' + (e && e.message ? e.message : e));
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  main().catch(e => {
+    console.error('error: ' + (e && e.message ? e.message : e));
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  parseIni,
+  resolveConfigModel,
+  serializeIni,
+  effectiveFolder,
+  buildPlistXml,
+  buildUnitText,
+  buildCronLine,
+  loadConfig,
+  writeConfig,
+};
